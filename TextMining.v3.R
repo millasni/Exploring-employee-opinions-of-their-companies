@@ -1,0 +1,1092 @@
+#' ---
+#' title: "Mining company reviews on Glassdoor"
+#' author: Liudmyla Kotusenko
+#' date: "March 2020"
+#' output:
+#'   pdf_document: default
+#'   html_document:
+#'     df_print: paged
+#' 
+#' geometry: margin=0.75in
+#' fontsize: 10pt
+#' always_allow_html: true
+#' ---
+#' 
+## ----setup, include=FALSE---------------------------------------------------------------------------------------------------------------
+knitr::opts_chunk$set(echo = TRUE)
+# header-includes: \usepackage{setspace}\onehalfspacing # to add to header to make 1.5 line spacing
+
+#' 
+#' ## 1. Loading necessary packages
+#' 
+## ----include=FALSE----------------------------------------------------------------------------------------------------------------------
+# install.packages("tidyverse")
+# install.packages("dplyr")
+# install.packages("scales")
+# install.packages("knitr")
+# install.packages("qdap")
+# install.packages("tm")
+# install.packages("RWeka")
+# install.packages("purrr")
+# install.packages("FactoMineR")
+# install.packages("factoextra")
+# install.packages("wordcloud") # to build word coulds
+# install.packages("viridisLite") # to change color in word clouds
+# install.packages("plotrix")
+# install.packages(corrplot) 
+# install.packages("topicmodels")
+# install.packages("tidytext")
+
+#' 
+## ----error=FALSE,message=FALSE,warning=FALSE--------------------------------------------------------------------------------------------
+library(tidyverse)
+library(dplyr)
+library(scales)
+library(knitr)
+library(qdap) # for TM
+library(tm) # for TM
+library(RWeka) 
+library("purrr") 
+library("rJava")
+library(ggplot2) # to make neat plots
+library("FactoMineR") # to run correspondence analysis (CA)
+library("factoextra") # to plot results from CA
+library("wordcloud") # to build word coulds
+library("viridisLite") # to change color in word clouds
+library("plotrix") # to make piramid plots
+library(corrplot) # to visualize chi-square residuals matrix
+library(topicmodels) # to run LDA (Latent Dirichlet Allocation)
+library(tidytext)
+
+
+# to resolve issues with qdap and RWeka related to Java:
+# 1. install Java 64-bit (the same as R version)
+# 2. Run this line (ensure the path is correct):
+# Sys.setenv(JAVA_HOME="C:/Program Files/Java/jre1.8.0_241")
+
+#' 
+#' ## 2. Exploring the data set
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+data <- read.csv("~/HEC/!Text and network mining/Team project/Glassdoor/data.csv", 
+                 stringsAsFactors=FALSE)
+
+#' 
+#' Let's briefly explore our data...
+## ---------------------------------------------------------------------------------------------------------------------------------------
+names(data)
+
+#' 
+#' Let's explore how many reviews per company (sector) we have and share of those who recommend a given company (sector).
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+options(digits=4)
+tab = data %>%
+  group_by(Company) %>%
+  summarize(n=n(), share_recom = mean(recom, na.rm = TRUE)*100)
+tab
+
+tab2 = data %>%
+  group_by(sector) %>%
+  summarize(n=n(), share_recom = mean(recom, na.rm = TRUE)*100)
+tab2
+
+#' 
+#' Plotting % people recommending their sectors
+## ----fig.height=1.7, fig.width=6--------------------------------------------------------------------------------------------------------
+data %>%
+  group_by(sector) %>%
+  summarize(n=n(), share_recom = mean(recom, na.rm = TRUE)*100) %>%
+  arrange(desc(share_recom)) %>%
+  ggplot(aes(x=reorder(sector, share_recom), y=share_recom, fill=sector)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  ggtitle("% employees recommending their company to a friend") +
+  xlab("") + ylab("% recommending")
+
+#' 
+#' Plotting % people recommending their companies
+## ---------------------------------------------------------------------------------------------------------------------------------------
+data %>%
+  group_by(Company,sector) %>%
+  summarize(n=n(), share_recom = mean(recom, na.rm = TRUE)*100) %>%
+  arrange(desc(share_recom)) %>%
+  ggplot(aes(x=reorder(Company, share_recom), y=share_recom, fill=sector)) +
+  geom_col() +
+  # facet_wrap(sector ~.) +
+  coord_flip() +
+  ggtitle("% employees recommending their company to a friend") +
+  xlab("") + ylab("% recommending")
+
+#' 
+#' ## 3. Creating the stopwords list
+#' 
+#' There are several lists of stopwords in R. Let's look at them.
+## ---------------------------------------------------------------------------------------------------------------------------------------
+sort(Top200Words) # explore Top200Words from qdapDictionaries package	
+sort(tm::stopwords("english"))
+
+#' 
+#' The first list seems a bit too extensive while the latter does not include some annoying words. Let's add a few words from the first to the second list.
+## ----message=FALSE, error=FALSE---------------------------------------------------------------------------------------------------------
+# looking at stopwords in tm::stopwords but not in Top200Words
+diff1 = anti_join(as.tibble(tm::stopwords("english")), 
+                  as.tibble(Top200Words))$value
+sort(diff1)
+
+# looking at stopwords in Top200Words but not in tm::stopwords
+diff2 = anti_join(as.tibble(Top200Words),
+                  as.tibble(tm::stopwords("english")))$value
+sort(diff2)
+
+# list of stopwords from Top200Words to add to tm list
+(add = sort(diff2)[c(2,5,7,9,10,15,21,27,30,31,36:38,44,50:51,54:55,59,62,68,88,104,106)])
+
+# creating our own list of stopwords to exclude
+stop.words = c(c(tm::stopwords("english"), add, "job", "work", "really", "always", "sometimes",
+                 "deloitte", "bmo", "bell", "kpmg", "rbc", "rogers", "telus", "videotron", 
+                 "td", "national", "bank", "cibc")) #
+sort(stop.words) # explore the full list of stopwords 
+
+# # We could also remove these words but let's keep them for now.
+# stop.words = c(stop.words, "lot", "lots", "like", "always", "sometimes",
+#               "years", "times") #  "high", "low", "bad",
+
+# create right away stopwords list for bi-gram treatment - we'll keep "work":
+stop.words2 = stop.words[-200]
+
+
+#' 
+#' ## 4. Getting the first quick-and-dirty plots
+#' Using the function `freq_terms` from the `qdap` package, we can make quick-and-drity plots with frequent pros and cons. We remove the stopwords and keep words with 3+ letters, and the function will remove punctuation. Plots show counts of pros and cons overall, across all companies/sectors.
+## ---------------------------------------------------------------------------------------------------------------------------------------
+plot(freq_terms(data$pros, top=30, at.least=3, stopwords=stop.words)) # plot top-30 pros
+plot(freq_terms(data$cons, top=30, at.least=3, stopwords=stop.words)) # plot top-30 cons
+
+#' 
+#' ## 5. Correspondence analysis on most frequent terms 
+#' 
+#' Let's see what we can get with stopword filtration and picking top-30 most frequent words across all companies, using the same `freq_terms` function. Correspondence analysis, widely used in market research, can help us get plots mapping companies along with the comments most associated to them. It takes as an input a 2-way table with terms in rows, companies in columns (in our case, but vise versa would also work) and raw frequencies (counts) of words per company in cells.
+#' 
+#' To make plots, we create a function that will take as an input several columns from a dataframe, number of terms to show, min.number of letters in a term and a stopwords list and produce a correspondence analysis plot.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# Create a function to produce CA plots
+# input to the function: dataframe with columns named "pros", "cons", "Company"
+CA_plot = function(terms.col=data$pros, # column with comments (pros or cons)
+                   comp.col=data$Company, # column with companies (or sectors)
+                   topNterms=20, # number of top-N terms to show, 20 by default
+                   minLettersInTerm=5, # min number of letters in a term to keep
+                   stopwords=stop.words) {
+  
+  company = unique(comp.col)
+  
+  # create df of most frequent terms from the whole corpus
+  pros = as.data.frame(freq_terms(terms.col, top=topNterms, 
+                                  at.least=minLettersInTerm, 
+                                  stopwords=stopwords))
+  pros.l = list()
+
+  # create a list containing a dataframe with most frequent terms per each company
+  # we take top-100 terms per company to ensure most frequent terms IN TOTAL are there
+  for (i in company) {
+    pros.l[[i]] = as.data.frame(freq_terms(terms.col[which(comp.col==i)], 
+                                           top=100, at.least=minLettersInTerm, 
+                                           stopwords=stopwords))
+  }
+  
+  # flatten our list to a dataframe
+  prosTop100 = list_df2df(pros.l, col1 = "Company")
+
+  prosTopX = prosTop100 %>%
+    filter(WORD %in% pros$WORD)
+  
+  # Using tidyr::pivot_wider to convert long data to wide
+  # to have words in rows, companies in cols and term frequencies (raw) in cells
+  prosTopXw = pivot_wider(prosTopX, names_from = Company, 
+                          values_from = FREQ)
+  
+  # to use CA() function, we need terms in rownames and not in a separate column
+  prosTopXw = as.data.frame(prosTopXw) # convert tibble to dataframe
+  prosTopXw[is.na(prosTopXw)]=0 # replace NA with 0
+  rownames(prosTopXw) = prosTopXw$WORD # set terms to rownames
+  prosTopXw = prosTopXw[,-1] # remove the first column with terms
+  # print(prosTopXw) # print a two-way table of raw frequencies 
+  pros.ca <- CA(prosTopXw, graph = FALSE) # run correspondence analysis
+  
+  # make a CA plot
+  # repel= TRUE to avoid text overlapping (slow if many points)
+  fviz_ca_biplot(pros.ca, repel = TRUE)
+}
+
+#' 
+#' Using the function just created, we can make CA plots, easily changing the number of top-most frequent terms and the term length accepted. We can play around with it, but the solution below is not bad. It should be noted that projection of multi-dimentional space on 2d plot may not be ideal, and sometimes words and companies may be situated close to each other while there is no relationship between them in reality (if measured by chi-square residuals). However, in most cases, such plots show decent results and can provide intuitive maps.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+set.seed(1234)
+CA_plot(terms.col=data$pros, comp.col=data$Company,
+                   topNterms=30, minLettersInTerm=5) +
+  ggtitle("Pros map (based on top-30 most frequent terms of 5+ letters)")
+
+#' 
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+CA_plot(terms.col=data$cons, comp.col=data$Company,
+                     topNterms=30, minLettersInTerm=5) +
+  ggtitle("Cons map (based on top-30 most frequent terms of 5+ letters)")
+
+#' 
+#' ## 6. Corpus creation and cleaning
+#' 
+#' Let's now delve into text mining and create our corpus and clean it. Accroding to the DataCamp, "if your text data is in a data frame you can use DataframeSource() for your analysis. The data frame passed to DataframeSource() must have a specific structure:
+#' 
+#'  * Column one must be called doc_id and contain a unique string for each row.
+#'  * Column two must be called text with "UTF-8" encoding (pretty standard).
+#'  * Any other columns, 3+ are considered metadata and will be retained as such."
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+names(data) 
+# Create dataframes suitable for corpus creation
+pros.df = data %>%
+  mutate(doc_id = c(1:n())) %>%
+  rename(text = pros) %>%
+  select(doc_id, text, Company, sector)
+
+cons.df = data %>%
+  mutate(doc_id = c(1:n())) %>%
+  rename(text = cons) %>%
+  select(doc_id, text, Company, sector)
+
+# create volatile corpus for pros and cons
+pros_corpus = VCorpus(DataframeSource(pros.df))  
+cons_corpus = VCorpus(DataframeSource(cons.df))  
+
+# explore corpus
+pros_corpus[[1]][1] # to look at text
+# meta(pros_corpus)[1] # to look at metadata (prints too much)
+
+#' 
+#' We can make a custom function for corpus cleaning that will remove extra white spaces, make everything lower case, filter stopwords, remove punctuation and stem the words. We would also like to complete stems to full words, however, **`stemCompletion()` function works with the term-document matrix (and not a corpus) so we will use it later in our analysis**.
+#' 
+#' Below, we create two functions for corpus cleaning: `clean_corpus()`, that includes stemming, and `clean_corpus2()` that does not include it. Most of the time in the analysis below, we will be using `clean_corpus()`.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# cleaning corpus based on tm package functions
+clean_corpus <- function(corpus){ 
+  corpus <- tm_map(corpus, stripWhitespace) # remove extra white spaces
+  corpus <- tm_map(corpus, content_transformer(tolower)) # everything to lower case
+  corpus <- tm_map(corpus, removeWords, stop.words) # filter stopwords
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, removeWords, stop.words) # some SW are very stubborn... 
+  corpus <- tm_map(corpus, stripWhitespace) # after stopword removal, new spaces are added
+  corpus <- tm_map(corpus, stemDocument) # stem the document.
+  return(corpus)
+}
+
+# the same function but without stemming
+clean_corpus2 <- function(corpus){ 
+  corpus <- tm_map(corpus, stripWhitespace) # remove extra white spaces
+  corpus <- tm_map(corpus, content_transformer(tolower)) # everything to lower case
+  corpus <- tm_map(corpus, removeWords, stop.words) # filter stopwords
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, removeWords, stop.words) # some SW are very stubborn... 
+  corpus <- tm_map(corpus, stripWhitespace) # after stopword removal, there are new spaces
+  return(corpus)
+}
+
+#' 
+#' Let's clean our corpora of pros and cons and compare one review before and after. For this comparison, we use a function that will stem our terms.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# with stemming
+pros_corpus.cl = clean_corpus(pros_corpus)
+cons_corpus.cl = clean_corpus(cons_corpus)
+
+# without stemming
+pros_corpus.cl2 = clean_corpus2(pros_corpus)
+cons_corpus.cl2 = clean_corpus2(cons_corpus)
+
+pros_corpus[[5]][1]
+pros_corpus.cl[[5]][1]
+
+#' 
+#' With the clean corpus, we can make our first word clouds of pros and cons across all companies. Let's not use stemming this time to make plots more readable.
+#' 
+## ----fig.width=8, size="small"----------------------------------------------------------------------------------------------------------
+color_pal <- viridis(n = 7)
+# without stemming
+wordcloud(pros_corpus.cl2, max.words = 70, colors = color_pal) # pros
+
+#' 
+#' 
+## ----fig.width=8, size="small"----------------------------------------------------------------------------------------------------------
+wordcloud(cons_corpus.cl2, max.words = 70, colors = color_pal) # cons
+
+#' 
+#' Next, we can create term-document and document-term matrices (TDM and DTM). We print TDM to explore the number of terms and the matrix sparcity. It's 100% for both matrices - our comments are quite short and each document covers just a tiny number of all terms in a corpus.
+#' 
+## ----fig.width=8------------------------------------------------------------------------------------------------------------------------
+(pros_tdm <- TermDocumentMatrix(pros_corpus.cl))
+(cons_tdm <- TermDocumentMatrix(cons_corpus.cl))
+
+pros_dtm <- DocumentTermMatrix(pros_corpus.cl)
+cons_dtm <- DocumentTermMatrix(cons_corpus.cl)
+
+#' 
+#' Using TDM, we can find correlations between some terms of interest. Here, I'm using stemmed terms, so it required some expreimentation/exploration before I found out what stems to use. Of course, if we don't stem, we will have to write "balance" instead of "balanc". For some terms, I set higher threshold for correlations because too much noise is returned.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# Some words from pros and their correlations with other words
+findAssocs(pros_tdm, "balanc", 0.1)
+findAssocs(pros_tdm, "life", 0.2)
+findAssocs(pros_tdm, "decent", 0.1)
+findAssocs(pros_tdm, "pay", 0.1)
+
+# Some words from cons and their correlations with other words
+findAssocs(cons_tdm, "balanc", 0.1)
+findAssocs(cons_tdm, "hour", 0.2)
+findAssocs(cons_tdm, "long", 0.1)
+findAssocs(cons_tdm, "low", 0.2)
+findAssocs(cons_tdm, "pay", 0.25)
+findAssocs(cons_tdm, "busi", 0.2)
+findAssocs(cons_tdm, "season", 0.2)
+
+#' 
+#' ## 7. Factor analysis
+#' 
+#' We can see what people tend to talk about by applying the factor analysis. For it, we use the DTM (documents in rows, terms in columns) after having stemmed our terms. Before proceeding, we remove the most sparse terms and turn our DTM to a dataframe. Deciding how many terms to keep is rather art than science, and after some experimenting, the below specification of `sparse` parameter seems satisfactory.  
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+pros_dtm1 <- removeSparseTerms(pros_dtm, sparse=0.98) 
+pros_dtm1.df = as.data.frame(as.matrix(pros_dtm1))
+
+cons_dtm1 <- removeSparseTerms(cons_dtm, sparse=0.97)
+cons_dtm1.df = as.data.frame(as.matrix(cons_dtm1))
+
+#' 
+#' We can run factor analysis now. After many options tried, these ones seem the best, though for cons we get a few factors that are difficult to interpret (they include too many keywords and are difficult to interpret). Notice that even though we concentrate on the most frequent terms, the factor analysis below explains only 15% and 22% of variance of terms in pros and cons, respectively, so inevitably we lose some less frequent terms. Also, in both cases, we fail to confirm the hypothesis that the number of factors we specified is sufficient (see low p-values in the outputs).  
+#' Though this is not a good practice, we will keep these solutions for their interpretability.
+#' 
+## ----echo=FALSE-------------------------------------------------------------------------------------------------------------------------
+def.chunk.hook  <- knitr::knit_hooks$get("chunk")
+knitr::knit_hooks$set(chunk = function(x, options) {
+  x <- def.chunk.hook(x, options)
+  ifelse(options$size != "normalsize", paste0("\n \\", options$size,"\n\n", x, "\n\n \\normalsize"), x)
+})
+
+#' 
+#' 
+## ----size="small", fig.width=8----------------------------------------------------------------------------------------------------------
+# sink("factor analysis.out") # to save FA output
+fa.pros = factanal(pros_dtm1.df,10,scores="regression")
+print(fa.pros, sort=TRUE) 
+
+fa.cons = factanal(cons_dtm1.df,9,scores="regression")
+print(fa.cons, sort=TRUE)
+# sink() # close the output file
+
+#' 
+#' 
+#' We create dataframes for pros and cons with company names, sectors and newly created factors. Based on the words in factors, we also make consise names for them. For cons, it was hard to come up with a good name in one case (since the factor mixes up a lot of things), so we call it "Miscellaneous."
+## ---------------------------------------------------------------------------------------------------------------------------------------
+names(pros.df)
+# create dataframes with company names and factors
+pros.df.fa = cbind(pros.df[,c(1,3:4)],fa.pros$scores)
+cons.df.fa = cbind(cons.df[,c(1,3:4)],fa.cons$scores)
+
+names(pros.df.fa)
+
+# after reviewing words in factors, create and add factor names
+
+colnames(pros.df.fa) = c("doc_id","Company","sector",
+                      "Work-life balance",
+"Career advancement opportunities",
+"Flexible working hours, WFH",
+"Exposure to different clients and industries",
+"Learning and growth opportunities",
+"Management support and teamwork",
+"Decent salary/benefits",
+"Interesting projects and smart people",
+"Learning and growth opportunities",
+"Friendly envorinment"
+)
+
+colnames(cons.df.fa) = c("doc_id","Company","sector",
+                        "Work-life balance",
+"Long hours",
+"Low pay",
+"Miscellaneous",
+"High expectations",
+"High pressure to meet sale targets",
+"Poor management",
+"Limited career growth opportunities",
+"High-stress environment"
+)
+
+#' 
+#' If we count the share of time each factor got value above 2 for each company, we can make correspondence analysis maps, similarly to what we did above, but this time with factors instead of words. We won't explore those shares as they are diffuclult to interpret due to all the data manipulations that we've undertaken to make our factor analysis. Still, they might be still good to highlight differences between companies on a plot and derive some high-level conclusions.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# create dataframes with companies in cols, factors in rows 
+# in cells: % of factor values above 2.
+prosFact = pros.df.fa %>%
+  pivot_longer(cols = -c("doc_id", "Company", "sector"), 
+               names_to = "factor",values_to = "correl") %>%
+  group_by(Company,factor) %>%
+  summarize(above2=sum(correl>=2)/n()) %>%
+  pivot_wider(names_from = Company,values_from = above2)
+
+consFact = cons.df.fa %>%
+  pivot_longer(cols = -c("doc_id", "Company", "sector"), 
+               names_to = "factor",values_to = "correl") %>%
+  group_by(Company,factor) %>%
+  summarize(above2=sum(correl>=2)/n()) %>%
+  pivot_wider(names_from = Company,values_from = above2)
+
+#' 
+#' These maps highlight pretty much the same as the ones above. People appreciate work in consulting because of learning and growth opportunities and smart coworkers, while in the other two sectors - mostly for flexible work hours, decent pay and work-life balance. 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# PROS 
+prosFact.df = as.data.frame(prosFact) # convert tibble to dataframe
+prosFact.df[is.na(prosFact.df)]=0 # replace NA with 0
+rownames(prosFact.df) = prosFact.df$factor # set company to rownames
+prosFact.df = prosFact.df[,-1] # remove the first column with terms
+pros.fa.ca <- CA(prosFact.df, graph = FALSE)
+set.seed(1)
+CA_FA_pros = fviz_ca_biplot(pros.fa.ca, repel = TRUE) +
+  ggtitle("Pros map (based on factor analysis)")
+CA_FA_pros
+
+#' 
+#' On the downside, people working in consulting face poor work-life balance while those in banks/telecom might face low career growth opportunities, poor management and high pressure to meet sales targets.
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# CONS
+consFact.df = as.data.frame(consFact) # convert tibble to dataframe
+consFact.df[is.na(consFact.df)]=0 # replace NA with 0
+rownames(consFact.df) = consFact.df$factor # set company to rownames
+consFact.df = consFact.df[,-1] # remove the first column with terms
+cons.fa.ca <- CA(consFact.df, graph = FALSE)
+set.seed(1)
+CA_FA_cons = fviz_ca_biplot(cons.fa.ca, repel = TRUE) +
+  ggtitle("Cons map (based on factor analysis)")
+CA_FA_cons
+
+#' 
+#' 
+#' ## 8. Exploring words in common
+#' 
+#' ### 8.1. Common words in pros and cons
+#' 
+#' This analysis was inspired by one of DataCamp courses on text mining.
+#' We can explore how many times different keywords are mentioned in pros and cons and plot words with the highest differences in mentions. For this, we create a function that will take a list of dataframes as input (one company/industry = one dataframe) and output a plot. We will be able to specify chart title, select top-N words to show along with the gap between left and right parts of the plot (to ensure words are shown in full).
+#' 
+#' **In this and several following chapters, we use stemming and then `stemCompletion()` function to complete stems with most frequent words from the dictionary.**
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# Augment our stopwords list
+stop.words = c(stop.words, "lot", "lots", "always", "sometimes",
+              "little", "nice")
+
+sort(stop.words)
+
+#' 
+#' 
+#' Let's create a **dictionary for stem completion**. To do this, we just pick 500 most frequent words from our corpus of all pros and cons. If there are several words with the same stem in this dictionary, e.g. learn and learning, while applying stemCompletion()` function, we will pick up the first (most frequent) term from the list to complete our stems.
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# create a dictionary
+top500terms = freq_terms(c(data$pros,data$cons), top=500, at.least=3, stopwords=stop.words)
+# top500terms$WORD
+
+#' 
+#' Here, we prepare data for several following functions: create lists for pros/cons & sectors/companies. One element in a list = one data frame = one company (or one sector). Separate lists created for pros and cons.  
+## ---------------------------------------------------------------------------------------------------------------------------------------
+
+# 2 lists with pros: 
+pros.sector.list = split(pros.df,f=pros.df$sector)
+pros.comp.list = split(pros.df,f=pros.df$Company)
+# 2 lists with cons: 
+cons.sector.list = split(cons.df,f=cons.df$sector)
+cons.comp.list = split(cons.df,f=cons.df$Company)
+
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+# create a function to make pyramid plots 
+# gap means the width between left and right part of the plot
+# we can change whether to use stemming or not within a function
+pyramid_plot = function(data, title =  "Words in Common", 
+                        topNwords = 25, gap = 100) {
+    # LOOP OVER PAIRS OF SECTORS OR COMPANIES
+    for (i in 1:(length(data)-1)) {
+      for (j in (i+1):length(data)) {
+        vec = NULL
+        # print(names(data[c(i,j)]))
+        text_i = paste(data[[i]]$text, collapse = " ")
+        text_j = paste(data[[j]]$text, collapse = " ")
+        vec = c(vec, text_i, text_j)
+        # Create a corpus and clean it
+        corpus <- VCorpus(VectorSource(vec))
+        
+        corpus_cl = clean_corpus(corpus) # using a function with stemming
+
+        # Create TDM with two sectors/companies at a time
+        tdm <- TermDocumentMatrix(corpus_cl)
+        # Give the columns distinct names
+        colnames(tdm) <- names(data[c(i,j)])
+        m <- as.matrix(tdm)
+        df = as.data.frame(m)
+        
+        comm_words <- df %>%
+          rownames_to_column(var = "word") %>%
+          # Keep rows where word appears everywhere
+        filter_all(all_vars(. > 0))
+
+        comm_words$difference = abs(comm_words[2] - comm_words[3])
+
+        top25_df = comm_words %>%
+        top_n(n=topNwords, wt = difference) 
+        top25_df = top25_df[order(top25_df$difference,decreasing = TRUE),]
+        
+        # stem completion
+        top25_df$word = stemCompletion(top25_df$word, dictionary = top500terms$WORD, type = "first")
+
+        pyramid.plot(
+          top25_df[,2],
+          top25_df[,3],
+          labels = top25_df$word,
+          # top.labels = c(names(data[i]), "Words", names(data[j])),
+          top.labels = c("Pros", "Words", "Cons"),
+          main = title,
+          unit = NULL, gap = gap)
+        }
+    }
+}
+
+#' 
+#' As we can see below, across all companies, *benefits*, *opportunities* and *peope* have the highest positive balance of mentions, while *management*, *hours* and *long* - the highest negative balance (the lower the term on the plot, the higher the absolute difference between its mentions in pros and cons).
+## ---------------------------------------------------------------------------------------------------------------------------------------
+pros_cons_list = list(pros.df, cons.df)
+names(pros_cons_list) = c("Pros", "Cons")
+pyramid_plot(pros_cons_list, title = "Words in pros and cons in common", topNwords = 20, gap = 290)
+
+#' 
+#' We can do the same comparisons within sectors. We see quite a bunch of terms with positive balance in banks, such as *benefits*, *opportunities*, *environment* and *culture*, while *management* is the term with the highest negative balance. In consulting, *opportunities*, *people* and *learning* stand out as terms with positive balance, while the major drawback is *long hours* and *work-life balance*. Telecom is attractive by its *benefits* but the *management* gathers a lot of complaints.
+#' 
+## ---------------------------------------------------------------------------------------------------------------------------------------
+pyramid_plot(list(pros.sector.list[[1]],cons.sector.list[[1]]), topNwords = 20, gap = 140,  
+             title = paste(names(pros.sector.list)[1], "pros and cons"))
+pyramid_plot(list(pros.sector.list[[2]],cons.sector.list[[2]]), topNwords = 20, gap = 140, 
+             title = paste(names(pros.sector.list)[2], "pros and cons"))
+pyramid_plot(list(pros.sector.list[[3]],cons.sector.list[[3]]), topNwords = 20, gap = 140,  
+             title = paste(names(pros.sector.list)[3], "pros and cons"))
+
+#' 
+#' ### 8.2. Common words across sectors and companies
+#' It could be nice to compare industries or companies side-by-side. A function to prepare data for such plots is provided below. As an input, it will take lists with pros/cons for *companies* and aggregate companies to sectors. 
+#' 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+# data = list with dataframes as above
+data_prep = function(data, max.words=25) {
+  vec = NULL
+    for (i in 1:length(data)) {
+    # print(names(data[i]))
+    text_i = paste(data[[i]]$text, collapse = " ")
+    vec = c(vec, text_i)
+  }
+  # Create corpus and clean it: choose whether to use stemming or not.
+  corpus <- VCorpus(VectorSource(vec))
+  corpus_cl = clean_corpus(corpus) # stemming
+  # corpus_cl = clean_corpus2(corpus) # no stemming
+  
+  # Create TDM with all sectors/companies to appear on the plot
+  tdm <- TermDocumentMatrix(corpus_cl) # one column per sector or company
+  # Give the columns distinct names
+  colnames(tdm) <- names(data)
+  # Create matrix
+  m <- as.matrix(tdm)
+  
+  x = m %>%
+  as_tibble(rownames = "Term") %>%
+  mutate(term_freq = rowSums(.[2:length(data)])) %>%
+  mutate(Banks = BMO+CIBC+NationalBank+RBC+Scotiabank+TD,
+         Consulting = Deloitte + EY + KPMG + PwC,
+         Telecom = Bell+Rogers+Telus+Videotron) %>%
+  arrange(desc(term_freq)) %>%
+  head(max.words)
+  
+  # stem completion
+  x$Term <- stemCompletion(x$Term, dictionary=top500terms$WORD,type="first")
+  
+  return(x)
+}
+
+pros_top = data_prep(pros.comp.list,max.words = 20)
+cons_top = data_prep(cons.comp.list,max.words = 20)
+
+#' 
+#' Let's compare most frequent terms mentioned in pros and cons across sectors. In all these plots, we divide term frequency by total number of reviews per company/industry to get % of reviews mentioning a given term.
+#' Again, consulting stands out among the three sectors with its specific pros.
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+pros_top %>%
+  select(Term,Banks,Consulting,Telecom) %>%
+  mutate(Banks=Banks/3000*100, Consulting=Consulting/1812*100, Telecom = Telecom/1619*100) %>%
+  pivot_longer(cols = -Term, names_to = "sector", values_to = "Count") %>%
+  group_by(Term,sector) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=sector)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(sector ~.) +
+  coord_flip() +
+  ggtitle("% reviews mentioning a term in a positive context across industries") +
+  xlab("") + ylab("")
+
+#' 
+#' 
+#' Consulting, again, stands out in cons with its work-life balance and long hours. Almost 40% of cons mention *hours*!
+#' 
+#' Stem completion is not capable to complete the word mani (many) and produces NA. Since this word is not informative, we remove it from all plots with cons (here and later on).
+#' 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+cons_top %>%
+  filter(!is.na(Term)) %>% # filter one line with NA
+  select(Term,Banks,Consulting,Telecom) %>%
+  # normalize by the number of reviews per sector (company)
+  mutate(Banks=Banks/3000*100, Consulting=Consulting/1812*100, Telecom = Telecom/1619*100) %>%
+  pivot_longer(cols = -Term, names_to = "sector", values_to = "Count") %>%
+  group_by(Term,sector) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=sector)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(sector ~.) +
+  coord_flip() +
+  ggtitle("% reviews mentioning a term in a negative context across industries") +
+  xlab("") + ylab("")
+
+#' 
+#' We can also dive deeper and explore how the companies within the same industry fare.
+#' There are some small differences in pros for consulting, but overall they are quite similar.
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+pros_top %>%
+  select(Term,Deloitte, EY, KPMG, PwC) %>%
+  mutate(Deloitte = Deloitte/500*100, EY = EY/374*100, KPMG = KPMG/438*100, PwC = PwC/500*100) %>%
+  pivot_longer(cols = -Term, names_to = "Company", values_to = "Count") %>%
+  group_by(Term,Company) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=Company)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(. ~ Company) +
+  coord_flip() +
+  ggtitle("Consulting: % reviews mentioning a term in a positive context") +
+  xlab("") + ylab("")
+
+#' 
+#' With regard to *long hours*, Deloitte tends to fare the best while EY the worst. 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+cons_top %>%
+  filter(!is.na(Term)) %>% # filter one line with NA
+  select(Term,Deloitte, EY, KPMG, PwC) %>%
+  mutate(Deloitte = Deloitte/500*100, EY = EY/374*100, KPMG = KPMG/438*100, PwC = PwC/500*100) %>%
+  pivot_longer(cols = -Term, names_to = "Company", values_to = "Count") %>%
+  group_by(Term,Company) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=Company)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(. ~ Company) +
+  coord_flip() +
+  ggtitle("Consulting: % reviews mentioning a term in a negative context") +
+  xlab("") + ylab("")
+
+#' 
+#' Among banks, National Bank tends to have the highest number of mentions of *benefits*, and the lowest of *culture* (where RBC stands out), but is in line or even outperforming others by *people* and *employees*.
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+pros_top %>%
+  select(Term, BMO, CIBC, NationalBank, RBC, Scotiabank, TD) %>%
+  mutate(BMO = BMO/500*100, CIBC = CIBC/500*100, NationalBank = NationalBank/500*100, 
+         RBC = RBC/500*100, Scotiabank = Scotiabank/500*100, TD = TD/500*100) %>%
+  pivot_longer(cols = -Term, names_to = "Company", values_to = "Count") %>%
+  group_by(Term,Company) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=Company)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(. ~ Company) +
+  coord_flip() +
+  ggtitle("Banks: % reviews mentioning a term in a positive context") +
+  xlab("") + ylab("")
+
+#' 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+cons_top %>%
+  filter(!is.na(Term)) %>% # filter one line with NA 
+  select(Term, BMO, CIBC, NationalBank, RBC, Scotiabank, TD) %>%
+  mutate(BMO = BMO/500*100, CIBC = CIBC/500*100, NationalBank = NationalBank/500*100, 
+         RBC = RBC/500*100, Scotiabank = Scotiabank/500*100, TD = TD/500*100) %>%
+  pivot_longer(cols = -Term, names_to = "Company", values_to = "Count") %>%
+  group_by(Term,Company) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=Company)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(. ~ Company) +
+  coord_flip() +
+  ggtitle("Banks: % reviews mentioning a term in a negative context") +
+  xlab("") + ylab("")
+
+#' 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+pros_top %>%
+  select(Term, Bell, Rogers, Telus, Videotron) %>%
+  mutate(Bell = Bell/500*100, Rogers = Rogers/500*100,  
+         Telus = Telus/500*100, Videotron = Videotron/119*100) %>%
+  pivot_longer(cols = -Term, names_to = "Company", values_to = "Count") %>%
+  group_by(Term,Company) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=Company)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(. ~ Company) +
+  coord_flip() +
+  ggtitle("Telecom: % reviews mentioning a term in a positive context") +
+  xlab("") + ylab("")
+
+#' 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+cons_top %>%
+  filter(!is.na(Term)) %>% # filter one line with NA 
+  select(Term, Bell, Rogers, Telus, Videotron) %>%
+  mutate(Bell = Bell/500*100, Rogers = Rogers/500*100,  
+         Telus = Telus/500*100, Videotron = Videotron/119*100) %>%
+  pivot_longer(cols = -Term, names_to = "Company", values_to = "Count") %>%
+  group_by(Term,Company) %>%
+  ggplot(aes(x=reorder(Term, Count), y=Count, fill=Company)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(. ~ Company) +
+  coord_flip() +
+  ggtitle("Telecom: % reviews mentioning a term in a negative context") +
+  xlab("") + ylab("")
+
+#' 
+#' 
+#' ## 9. Chi-square residuals analysis
+## ---------------------------------------------------------------------------------------------------------------------------------------
+pros_top
+
+#' 
+#' Similarly to Correspondence analysis, we can use term frequencies per company to calculate chi-square residuals for term/company ompbinations. The higher/lower the residual in ABSOLUTE value, the more/less the connection between a term and a company is outstanding. As a rule of thumb, residuals below 2 in absolute value point to the average connection between a term and a company. Absolute values of residuals above 2 point to a connection between a term and a company: high positive (negative) residuals mean that a characteristic is over-represented (under-represented) for a given company.
+#' 
+#' **Here, again, we use stemming and then `stemCompletion()` to complete stems with most frequent words from the dictionary.** Below are chi-square test residuals for pros (first plot) and cons (second plot) for all companies. 
+## ----fig.height=6, fig.width=6----------------------------------------------------------------------------------------------------------
+pros_sec = pros_top %>%
+  # select(-Banks,-Consulting,-Telecom)
+  select(Term, Deloitte, EY, KPMG, PwC, Bell, Rogers, Telus, Videotron,
+         BMO, CIBC, NationalBank, RBC, Scotiabank, TD)
+
+pros_sec_m = as.matrix(pros_sec[,2:15])
+rownames(pros_sec_m) = pros_sec$Term
+chisq_all_pros = chisq.test(pros_sec_m)
+
+corrplot(chisq_all_pros$residuals, method = "number", is.corr = FALSE, tl.col = "tomato2", tl.cex = 0.8,
+         number.cex = 0.7)
+
+#' 
+## ----fig.height=6, fig.width=6, warning=F,error=F---------------------------------------------------------------------------------------
+cons_sec = cons_top %>%
+  filter(!is.na(Term)) %>% # filter one line with NA 
+  # select(-Banks,-Consulting,-Telecom)
+  select(Term, Deloitte, EY, KPMG, PwC, Bell, Rogers, Telus, Videotron,
+         BMO, CIBC, NationalBank, RBC, Scotiabank, TD)
+
+cons_sec_m = as.matrix(cons_sec[,2:15])
+rownames(cons_sec_m) = cons_sec$Term
+chisq_all_cons = chisq.test(cons_sec_m)
+
+# chisq_all_cons$residuals[sort(chisq_all_cons$residuals[,1],decreasing=T),]
+corrplot(chisq_all_cons$residuals, method = "number", is.corr = FALSE, tl.col = "tomato2", tl.cex = 0.8,
+         number.cex = 0.7)
+
+#' 
+#' 
+#' ## 10. Creating bi-grams
+#' 
+#' To see what combinations of two terms exist, we remove word "work" from the stoplist to keep it in our corpus but we want to keep some words like nice etc. that we removed later in uni-gram analysis. That's why I created `stop.words2` list at the beginning of this document.
+#' 
+#' Once we create bi-grams, the number of terms in our TDM explodes: from about 6,000 for uni-grams (across all pros and cons) to about 70,000 for bi-grams. At the same time, the frequency per term declines substantially.
+#' 
+#' Next, we manually grouped several most often synonymes in the form of bi-grams, e.g., "lifework balanc" and
+#' "worklif balanc". This process takes **a lot of time**, so we cleaned only 11 top-most frequent bi-gram combinations for both pros and cons as shown below:
+#' 
+#'  * "worklife balance",
+#'  * "remote work",
+#'  * "flexible hours",
+#'  * "long hours",
+#'  * "learning opportunities",
+#'  * "growth opportunities",
+#'  * "senior management",
+#'  * "low pay",
+#'  * "company culture",
+#'  * "busy season",
+#'  * "high turnover".
+#' 
+#' **It's not easy to complete stems for bi-grams, so here we leave stems uncompleted.**
+#' 
+## ----message=FALSE, error=FALSE, warning=FALSE------------------------------------------------------------------------------------------
+# data = list with dataframes as above
+data_prep_bigram = function(data, max.words=25) {
+  vec = NULL
+    for (i in 1:length(data)) {
+    # print(names(data[i]))
+    text_i = paste(data[[i]]$text, collapse = " ")
+    vec = c(vec, text_i)
+  }
+  # Create corpus and clean it
+  corpus <- VCorpus(VectorSource(vec))
+  
+  # clean corpus
+  corpus_cl <- tm_map(corpus, stripWhitespace)
+  corpus_cl <- tm_map(corpus_cl, content_transformer(tolower))
+  corpus_cl <- tm_map(corpus_cl, removeWords, stop.words2)
+  corpus_cl <- tm_map(corpus_cl, removePunctuation)
+  corpus_cl  <- tm_map(corpus_cl, stemDocument)
+  corpus_cl <- tm_map(corpus_cl, removeWords, stop.words2)
+  corpus_cl <- tm_map(corpus_cl, stripWhitespace) 
+  
+workLifeBalance = c("work life balanc",
+  "life unbalanc",
+"lifework balanc",
+"worklif balanc",
+"worklifestyl balanc",
+"worklik balanc",
+"work life balanc",
+"work life unbalanc",
+"work lifework balanc",
+"work time balanc",
+"work balanc",
+"hectic balanc",
+"word life balanc",
+"work famili balanc")
+
+for (i in 1:length(data)) {
+  for (j in workLifeBalance) {
+  corpus_cl[[i]][1] = gsub(j, "worklife balance", corpus_cl[[i]][1])
+  }
+}
+
+work_from_home = c("flexibl work home",
+                   "remot work",
+                   "remot workstyl",
+                   "remot home",
+                   "remot flexibl place",
+                   "wfh",
+                   "work home"
+                   )
+
+for (i in 1:length(data)) {
+  for (j in work_from_home) {
+  corpus_cl[[i]][1] = gsub(j, "remote work", corpus_cl[[i]][1])
+  }
+}
+
+flexible_hours = c("flexibl work",
+                   "flexibl workstyl",
+                   "flexibl work style",
+                   "flexibl schedul",
+                   "flexibl hour",
+                   "flexibl shift",
+                   "flexibl time",
+                   "flexibl offic hour",
+                   "flexible hourslife",
+                   "flexibl work time"
+                   )
+
+for (i in 1:length(data)) {
+  for (j in flexible_hours) {
+  corpus_cl[[i]][1] = gsub(j, "flexible hours", corpus_cl[[i]][1])
+  }
+}
+
+long_hours = c("long hour",
+               "long hourslow",
+               "long hoursw",
+               "long work hour",
+               "long work",
+               "high work hour",
+               "crazi work hour",
+               "work long"
+)
+
+for (i in 1:length(data)) {
+  for (j in long_hours) {
+  corpus_cl[[i]][1] = gsub(j, "long hours", corpus_cl[[i]][1])
+  }
+}
+
+learn_opport = c("learn lot",
+                 "opportun learn",
+                 "learn opportun",
+                 "learn oppurtun",
+                 "learn new",
+                 "learn veri fast")
+
+for (i in 1:length(data)) {
+  for (j in learn_opport) {
+  corpus_cl[[i]][1] = gsub(j, "learning opportunities", corpus_cl[[i]][1])
+  }
+}
+
+growth_opport = c("growth opportun",
+                  "opportun growth",
+                  "opportun grow",
+                  "opportun growdevelop",
+                  "opportun grown",
+                  "career growth",
+                  "career grow",
+                  "career growrg",
+                  "career growthdevelop",
+                  "career growthprogress",
+                  "lot opportun")
+
+for (i in 1:length(data)) {
+  for (j in growth_opport) {
+  corpus_cl[[i]][1] = gsub(j, "growth opportunities", corpus_cl[[i]][1])
+  }
+}
+
+senior_manag = c("senior manag",
+                 "upper manag")
+
+for (i in 1:length(data)) {
+  for (j in senior_manag) {
+  corpus_cl[[i]][1] = gsub(j, "senior management", corpus_cl[[i]][1])
+  }
+}
+
+low_pay = c("low pay",
+            "low salari",
+            "low base",
+            "low compar",
+            "low compens",
+            "low wage",
+            "lower pay",
+            "lower averag",
+            "lower avg",
+            "lower base",
+            "lowest salari",
+            "lowest pay",
+            "lowish pay",
+            "lowish salari",
+            "lowno bonus")
+
+for (i in 1:length(data)) {
+  for (j in low_pay) {
+  corpus_cl[[i]][1] = gsub(j, "low pay", corpus_cl[[i]][1])
+  }
+}
+
+work_culture = c("work cultur",
+                 "compani cultur",
+                 "team cultur",
+                 "corp cultur",
+                 "corpor cultur",
+                 "corprat cultur",
+                 "corrupt cultur",
+                 "cowork cultur",
+                 "crappi cultur",
+                 "creat cultur",
+                 "cultur cultur",
+                 "cultur multicultur",
+                 "custom cultur",
+                  "decent cultur",
+                 "amaz cultur",
+                 "opportun cultur",
+                 "opportunities cultur",
+                 "nice cultur",
+                 "offic cultur",
+                 "leadership cultur",
+                 "learn cultur",
+                 "leader cultur",
+                 "inclus cultur",
+                 "grow cultur",
+                 "growth cultur",
+                 "firm cultur",
+                 "excel cultur"
+                 )
+
+for (i in 1:length(data)) {
+  for (j in work_culture) {
+  corpus_cl[[i]][1] = gsub(j, "company culture", corpus_cl[[i]][1])
+  }
+}
+
+busy_season = c("busi season",
+                 "peak season",
+                "tax season"
+)
+
+for (i in 1:length(data)) {
+  for (j in busy_season) {
+  corpus_cl[[i]][1] = gsub(j, "busy season", corpus_cl[[i]][1])
+  }
+}
+
+high_turnov = c("high turnov","staff turnov","employe turnov","lot turnov", "manag turnov")
+
+for (i in 1:length(data)) {
+  for (j in high_turnov) {
+  corpus_cl[[i]][1] = gsub(j, "high turnover", corpus_cl[[i]][1])
+  }
+}
+
+#creating bigrams/trigrams
+tokenizer <- function(x)
+  NGramTokenizer(x, Weka_control(min=2, max=2))
+
+all_tdm_bi <- TermDocumentMatrix(corpus_cl, control = list(tokenize=tokenizer))
+
+colnames(all_tdm_bi) <- names(data)
+all_m_bi <- as.matrix(all_tdm_bi)
+
+df.bi <- as.data.frame(all_m_bi)
+df.bi <- rownames_to_column(df.bi, "Term")
+
+x = df.bi %>%
+  mutate(term_freq = rowSums(.[2:length(data)])) %>%
+  mutate(Banks = BMO+CIBC+NationalBank+RBC+Scotiabank+TD,
+         Consulting = Deloitte + EY + KPMG + PwC,
+         Telecom = Bell+Rogers+Telus+Videotron) %>%
+  arrange(desc(term_freq)) %>%
+  head(max.words)
+  
+  return(x)
+}
+
+pros_top_bi = data_prep_bigram(pros.comp.list,max.words = 20)
+cons_top_bi = data_prep_bigram(cons.comp.list,max.words = 20)
+
+#' 
+#' 
+#' ## 11. Chi-square residulas analysis on bi-grams
+#' 
+#' Among our bi-grams, we have a mix of those that underwent manual cleaning and those that did not. **The frequencies of the manually treated terms will be higher (and more accurate) than for those not treated, other things being equal** (since we combine several terms into one), so we should not compare frequencies across bi-grams.
+#' 
+#' However, **the relative frequency of terms across companies is still meaningful** and shows how companies compare to each other over a given characteristic (term). In this regard, analysis of chi-square residuals shows which terms stand out for which companies. It allows comparing terms across the line (across companies) but it disregards how widespread (frequent) a given bi-gram across our corpus is. 
+#' 
+#' Many findings from the uni-gram analysis are reconfirmed by bi-grams. However, bi-grams allow us to obtain more granular information at the company level. For example, we can learn that several banks have nice work enironment, but there is some micro-management and office polictics, and so on.
+#' 
+## ----fig.height=6, fig.width=6, warning=FALSE-------------------------------------------------------------------------------------------
+pros_sec = pros_top_bi %>%
+  # select(-Banks,-Consulting,-Telecom)
+  select(Term, Deloitte, EY, KPMG, PwC, Bell, Rogers, Telus, Videotron,
+         BMO, CIBC, NationalBank, RBC, Scotiabank, TD)
+
+pros_sec_m = as.matrix(pros_sec[,2:15])
+rownames(pros_sec_m) = pros_sec$Term
+chisq_all_pros = chisq.test(pros_sec_m)
+
+corrplot(chisq_all_pros$residuals, method = "number", is.corr = FALSE, tl.col = "tomato2", tl.cex = 0.8,
+         number.cex = 0.7)
+
+#' 
+#' 
+## ----fig.height=6, fig.width=6, warning=F,error=F---------------------------------------------------------------------------------------
+cons_sec = cons_top_bi %>%
+  # select(-Banks,-Consulting,-Telecom)
+  select(Term, Deloitte, EY, KPMG, PwC, Bell, Rogers, Telus, Videotron,
+         BMO, CIBC, NationalBank, RBC, Scotiabank, TD)
+
+cons_sec_m = as.matrix(cons_sec[,2:15])
+rownames(cons_sec_m) = cons_sec$Term
+chisq_all_cons = chisq.test(cons_sec_m)
+
+# chisq_all_cons$residuals[sort(chisq_all_cons$residuals[,1],decreasing=T),]
+corrplot(chisq_all_cons$residuals,method = "number", is.corr = FALSE, tl.col = "tomato2", tl.cex = 0.8,
+         number.cex = 0.7)
+
